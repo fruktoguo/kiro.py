@@ -1,5 +1,7 @@
 """认证工具函数 - 参考 src/common/auth.rs"""
 
+import hashlib
+
 
 def extract_api_key(headers: dict) -> str | None:
     """从请求头中提取 API Key
@@ -19,3 +21,7 @@ def extract_api_key(headers: dict) -> str | None:
         return auth[7:].strip()
 
     return None
+
+
+def sha256_hex(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()

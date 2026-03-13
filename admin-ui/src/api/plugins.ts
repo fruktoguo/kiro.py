@@ -17,12 +17,36 @@ export interface PluginManifest {
   icon: string
   has_frontend: boolean
   api_prefix: string
+  public_mount?: string
 }
 
 // 获取已加载插件列表
 export async function getPlugins(): Promise<PluginManifest[]> {
   const { data } = await api.get<{ plugins: PluginManifest[] }>('/plugins')
   return data.plugins
+}
+
+export type RemoteApiName =
+  | 'availableCredentials'
+  | 'batchImport'
+  | 'restart'
+  | 'refreshQuota'
+  | 'totalRemainingQuota'
+  | 'todayTokenTotal'
+  | 'totalCalls'
+
+export interface RemoteApiConfig {
+  enabledApis: Record<RemoteApiName, boolean>
+}
+
+export async function getRemoteApiConfig(): Promise<RemoteApiConfig> {
+  const { data } = await api.get<RemoteApiConfig>('/plugins/remote-api/config')
+  return data
+}
+
+export async function updateRemoteApiConfig(enabledApis: Partial<Record<RemoteApiName, boolean>>): Promise<RemoteApiConfig> {
+  const { data } = await api.put<RemoteApiConfig>('/plugins/remote-api/config', { enabledApis })
+  return data
 }
 
 // ============ Restock 插件 API ============
