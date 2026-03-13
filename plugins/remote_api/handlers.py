@@ -35,8 +35,8 @@ def build_remote_api_config_path(admin_service) -> Path:
         cache_dir = None
 
     if cache_dir:
-        return Path(cache_dir) / "remote_api_plugin.json"
-    return Path(__file__).resolve().parent / "config.json"
+        return Path(cache_dir) / "runtime" / "plugins" / "remote_api" / "config.json"
+    return Path(__file__).resolve().parents[2] / "runtime" / "plugins" / "remote_api" / "config.json"
 
 
 class RemoteApiConfigStore:
