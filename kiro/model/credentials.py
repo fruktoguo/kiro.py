@@ -35,6 +35,10 @@ class KiroCredentials:
     proxy_username: Optional[str] = None
     proxy_password: Optional[str] = None
     disabled: bool = False
+    # Kiro API Key（headless 模式）
+    # 格式: ksk_xxxxxxxx
+    # 设置后直接作为 Bearer Token 使用，无需 refreshToken
+    kiro_api_key: Optional[str] = None
 
     # JSON key 映射
     _KEY_MAP = {
@@ -53,13 +57,19 @@ class KiroCredentials:
         "balanceUpdatedAt": "balance_updated_at",
         "proxyUrl": "proxy_url", "proxyUsername": "proxy_username",
         "proxyPassword": "proxy_password", "disabled": "disabled",
+        "kiroApiKey": "kiro_api_key",
     }
     _REVERSE_KEY_MAP = {v: k for k, v in _KEY_MAP.items()}
 
     def canonicalize_auth_method(self):
-        """规范化 auth_method: builder-id/iam → idc"""
-        if self.auth_method and self.auth_method.lower() in ("builder-id", "iam"):
+        """规范化 auth_method: builder-id/iam → idc, apikey → api_key"""
+        if not self.auth_method:
+            return
+        low = self.auth_method.lower()
+        if low in ("builder-id", "iam"):
             self.auth_method = "idc"
+        elif low in ("api_key", "apikey"):
+            self.auth_method = "api_key"
 
     def effective_auth_region(self, config) -> str:
         """获取有效的 Auth Region
@@ -96,6 +106,21 @@ class KiroCredentials:
         if self.subscription_title:
             return "FREE" not in self.subscription_title.upper()
         return True
+
+    def is_api_key_credential(self) -> bool:
+        """检查是否为 API Key 凭据
+
+        API Key 凭据直接使用 kiro_api_key 作为 Bearer Token，无需 refreshToken。
+        满足以下任一条件即视为 API Key 凭据：
+        - 设置了 kiro_api_key
+        - auth_method 为 api_key / apikey
+        """
+        if self.kiro_api_key:
+            return True
+        if self.auth_method:
+            low = self.auth_method.lower()
+            return low in ("api_key", "apikey")
+        return False
 
     def clone(self) -> "KiroCredentials":
         import copy

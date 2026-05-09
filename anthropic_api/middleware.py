@@ -20,7 +20,9 @@ class AppState:
     """应用共享状态"""
     api_key: str
     kiro_provider: Optional[object] = None
-    profile_arn: Optional[str] = None
+    # profile_arn 已移除：由 provider 层根据实际凭据动态注入到请求体
+    # 是否开启非流式响应的 thinking 块提取（来自 config.extract_thinking）
+    extract_thinking: bool = True
 
 
 class AuthMiddleware:

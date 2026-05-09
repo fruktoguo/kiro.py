@@ -116,7 +116,7 @@ class SetPriorityRequest:
 
 @dataclass
 class AddCredentialRequest:
-    refresh_token: str = ""
+    refresh_token: Optional[str] = None
     auth_method: str = "social"
     client_id: Optional[str] = None
     client_secret: Optional[str] = None
@@ -129,11 +129,14 @@ class AddCredentialRequest:
     proxy_url: Optional[str] = None
     proxy_username: Optional[str] = None
     proxy_password: Optional[str] = None
+    # Kiro API Key（API Key 凭据必填，格式: ksk_xxxxxxxx）
+    # 设置后直接作为 Bearer Token 使用，无需 refreshToken
+    kiro_api_key: Optional[str] = None
 
     @classmethod
     def from_dict(cls, data: dict) -> "AddCredentialRequest":
         return cls(
-            refresh_token=data.get("refreshToken", ""),
+            refresh_token=data.get("refreshToken"),
             auth_method=data.get("authMethod", "social"),
             client_id=data.get("clientId"),
             client_secret=data.get("clientSecret"),
@@ -146,6 +149,7 @@ class AddCredentialRequest:
             proxy_url=data.get("proxyUrl"),
             proxy_username=data.get("proxyUsername"),
             proxy_password=data.get("proxyPassword"),
+            kiro_api_key=data.get("kiroApiKey"),
         )
 
 

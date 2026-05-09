@@ -10,7 +10,7 @@ import logging
 import random
 import threading
 import uuid
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
 import httpx
 
@@ -21,6 +21,9 @@ from kiro.token_manager import CallContext, MultiTokenManager
 
 logger = logging.getLogger(__name__)
 
+if TYPE_CHECKING:
+    from proxy_runtime import ProxyRuntime
+
 # 每个凭据的最大重试次数
 MAX_RETRIES_PER_CREDENTIAL = 3
 # 总重试次数硬上限
@@ -30,9 +33,15 @@ MAX_TOTAL_RETRIES = 9
 class KiroProvider:
     """Kiro API Provider，支持多凭据故障转移和重试"""
 
-    def __init__(self, token_manager: MultiTokenManager, proxy: Optional[ProxyConfig] = None):
+    def __init__(
+        self,
+        token_manager: MultiTokenManager,
+        proxy: Optional[ProxyConfig] = None,
+        proxy_runtime: Optional["ProxyRuntime"] = None,
+    ):
         self._token_manager = token_manager
         self._global_proxy = proxy
+        self._proxy_runtime = proxy_runtime
         self._client_cache: dict[Optional[ProxyConfig], httpx.AsyncClient] = {}
         self._cache_lock = threading.Lock()
 
@@ -46,13 +55,20 @@ class KiroProvider:
 
     def client_for(self, credentials: KiroCredentials) -> httpx.AsyncClient:
         """按代理配置缓存 httpx.AsyncClient"""
-        effective = credentials.effective_proxy(self._global_proxy)
+        effective = self._resolve_proxy(credentials)
         with self._cache_lock:
             if effective in self._client_cache:
                 return self._client_cache[effective]
             client = build_client(effective, timeout_secs=720)
             self._client_cache[effective] = client
             return client
+
+    def _resolve_proxy(self, credentials: Optional[KiroCredentials]) -> Optional[ProxyConfig]:
+        if self._proxy_runtime:
+            return self._proxy_runtime.resolve_for_credentials(credentials)
+        if credentials is None:
+            return self._global_proxy
+        return credentials.effective_proxy(self._global_proxy)
 
     # --- URL 构建 ---
 
@@ -96,10 +112,10 @@ class KiroProvider:
         kv = config.kiro_version
         os_name = config.system_version
         nv = config.node_version
-        x_amz_ua = f"aws-sdk-js/1.0.27 KiroIDE-{kv}-{machine_id}"
-        ua = f"aws-sdk-js/1.0.27 ua/2.1 os/{os_name} lang/js md/nodejs#{nv} api/codewhispererstreaming#1.0.27 m/E KiroIDE-{kv}-{machine_id}"
+        x_amz_ua = f"aws-sdk-js/1.0.34 KiroIDE-{kv}-{machine_id}"
+        ua = f"aws-sdk-js/1.0.34 ua/2.1 os/{os_name} lang/js md/nodejs#{nv} api/codewhispererstreaming#1.0.34 m/E KiroIDE-{kv}-{machine_id}"
 
-        return {
+        headers = {
             "Content-Type": "application/json",
             "x-amzn-codewhisperer-optout": "true",
             "x-amzn-kiro-agent-mode": "vibe",
@@ -111,6 +127,10 @@ class KiroProvider:
             "Authorization": f"Bearer {ctx.token}",
             "Connection": "keep-alive",
         }
+        # API Key 凭据添加 tokentype 标识
+        if ctx.credentials.is_api_key_credential():
+            headers["tokentype"] = "API_KEY"
+        return headers
 
     def build_mcp_headers(self, ctx: CallContext) -> dict[str, str]:
         """构建 MCP 请求头"""
@@ -122,10 +142,10 @@ class KiroProvider:
         kv = config.kiro_version
         os_name = config.system_version
         nv = config.node_version
-        x_amz_ua = f"aws-sdk-js/1.0.27 KiroIDE-{kv}-{machine_id}"
-        ua = f"aws-sdk-js/1.0.27 ua/2.1 os/{os_name} lang/js md/nodejs#{nv} api/codewhispererstreaming#1.0.27 m/E KiroIDE-{kv}-{machine_id}"
+        x_amz_ua = f"aws-sdk-js/1.0.34 KiroIDE-{kv}-{machine_id}"
+        ua = f"aws-sdk-js/1.0.34 ua/2.1 os/{os_name} lang/js md/nodejs#{nv} api/codewhispererstreaming#1.0.34 m/E KiroIDE-{kv}-{machine_id}"
 
-        return {
+        headers = {
             "content-type": "application/json",
             "x-amz-user-agent": x_amz_ua,
             "user-agent": ua,
@@ -135,6 +155,13 @@ class KiroProvider:
             "Authorization": f"Bearer {ctx.token}",
             "Connection": "keep-alive",
         }
+        # MCP 请求需要携带 profile ARN（如果凭据中存在）
+        if ctx.credentials.profile_arn:
+            headers["x-amzn-kiro-profile-arn"] = ctx.credentials.profile_arn
+        # API Key 凭据添加 tokentype 标识
+        if ctx.credentials.is_api_key_credential():
+            headers["tokentype"] = "API_KEY"
+        return headers
 
     # --- API 调用 ---
 
@@ -201,6 +228,33 @@ class KiroProvider:
         jitter = random.randint(0, 3)
         return base + jitter
 
+    @staticmethod
+    def is_bearer_token_invalid(body: str) -> bool:
+        """检查响应体是否包含 bearer token 失效的特征消息
+
+        当上游已使 accessToken 失效但本地 expiresAt 未到期时，
+        API 会返回 401/403 并携带此特征消息。
+        """
+        return "The bearer token included in the request is invalid" in body
+
+    @staticmethod
+    def inject_profile_arn(request_body: str, profile_arn: Optional[str]) -> str:
+        """将凭据的 profile_arn 注入到请求体 JSON 中
+
+        修复刷新/切换凭据后请求体仍携带旧 ARN 的问题。
+        解析失败时原样返回。
+        """
+        if not profile_arn:
+            return request_body
+        try:
+            data = json.loads(request_body)
+        except (json.JSONDecodeError, TypeError):
+            return request_body
+        if not isinstance(data, dict):
+            return request_body
+        data["profileArn"] = profile_arn
+        return json.dumps(data, ensure_ascii=False)
+
     async def _call_api_with_retry(self, request_body: str, is_stream: bool) -> httpx.Response:
         """带重试逻辑的 API 调用"""
         total_creds = self._token_manager.total_count()
@@ -208,6 +262,7 @@ class KiroProvider:
         last_error: Optional[Exception] = None
         api_type = "流式" if is_stream else "非流式"
         model = self.extract_model_from_request(request_body)
+        force_refreshed: set[int] = set()  # 每凭据仅允许一次强制刷新机会
 
         for attempt in range(max_retries):
             try:
@@ -223,13 +278,17 @@ class KiroProvider:
                 last_error = e
                 continue
 
+            # 动态注入实际凭据的 profile_arn（修复刷新/切换后携带过期 ARN 的问题）
+            effective_body = self.inject_profile_arn(request_body, ctx.credentials.profile_arn)
+            body_bytes = effective_body.encode("utf-8")
+
             client = self.client_for(ctx.credentials)
             try:
                 if is_stream:
-                    req = client.build_request("POST", url, headers=headers, content=request_body.encode("utf-8"))
+                    req = client.build_request("POST", url, headers=headers, content=body_bytes)
                     response = await client.send(req, stream=True)
                 else:
-                    response = await client.post(url, headers=headers, content=request_body.encode("utf-8"))
+                    response = await client.post(url, headers=headers, content=body_bytes)
             except Exception as e:
                 if isinstance(e, httpx.PoolTimeout):
                     logger.error("API 连接池等待超时，立即失败以避免请求积压: %s", e)
@@ -267,6 +326,19 @@ class KiroProvider:
 
             # 401/403 凭据问题
             if status in (401, 403):
+                # token 被上游失效：先尝试 force-refresh，每凭据仅一次机会
+                if (self.is_bearer_token_invalid(body)
+                        and ctx.id not in force_refreshed
+                        and not ctx.credentials.is_api_key_credential()):
+                    force_refreshed.add(ctx.id)
+                    logger.info("凭据 #%d token 疑似被上游失效，尝试强制刷新", ctx.id)
+                    try:
+                        await self._token_manager.force_refresh_token_for(ctx.id)
+                        logger.info("凭据 #%d token 强制刷新成功，重试请求", ctx.id)
+                        continue
+                    except Exception as ref_err:
+                        logger.warning("凭据 #%d token 强制刷新失败，计入失败: %s", ctx.id, ref_err)
+
                 logger.warning("API 请求失败（可能为凭据错误，尝试 %d/%d）: %d %s", attempt + 1, max_retries, status, body)
                 if not self._token_manager.report_failure(ctx.id):
                     raise RuntimeError(f"{api_type} API 请求失败（所有凭据已用尽）: {status} {body}")
@@ -310,6 +382,7 @@ class KiroProvider:
         total_creds = self._token_manager.total_count()
         max_retries = min(total_creds * MAX_RETRIES_PER_CREDENTIAL, MAX_TOTAL_RETRIES)
         last_error: Optional[Exception] = None
+        force_refreshed: set[int] = set()  # 每凭据仅允许一次强制刷新机会
 
         for attempt in range(max_retries):
             try:
@@ -357,6 +430,19 @@ class KiroProvider:
                 raise RuntimeError(f"MCP 请求失败: {status} {body}")
 
             if status in (401, 403):
+                # token 被上游失效：先尝试 force-refresh，每凭据仅一次机会
+                if (self.is_bearer_token_invalid(body)
+                        and ctx.id not in force_refreshed
+                        and not ctx.credentials.is_api_key_credential()):
+                    force_refreshed.add(ctx.id)
+                    logger.info("凭据 #%d token 疑似被上游失效，尝试强制刷新", ctx.id)
+                    try:
+                        await self._token_manager.force_refresh_token_for(ctx.id)
+                        logger.info("凭据 #%d token 强制刷新成功，重试 MCP 请求", ctx.id)
+                        continue
+                    except Exception as ref_err:
+                        logger.warning("凭据 #%d token 强制刷新失败，计入失败: %s", ctx.id, ref_err)
+
                 if not self._token_manager.report_failure(ctx.id):
                     raise RuntimeError(f"MCP 请求失败（所有凭据已用尽）: {status} {body}")
                 last_error = RuntimeError(f"MCP 请求失败: {status} {body}")

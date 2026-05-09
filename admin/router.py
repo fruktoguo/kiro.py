@@ -3,8 +3,8 @@
 from fastapi import APIRouter
 
 from admin.handlers import (
-    add_credential, delete_credential, get_all_credentials,
-    get_credential_balance, get_git_log, get_git_status,
+    add_credential, delete_credential, force_refresh_token,
+    get_all_credentials, get_credential_balance, get_git_log, get_git_status,
     get_log_status, get_model_list, get_raw_credentials,
     get_request_stats, get_routing_config, get_runtime_logs, get_system_stats,
     get_update_status, get_version_info, reset_all_counters,
@@ -28,6 +28,7 @@ def create_admin_router() -> APIRouter:
     router.add_api_route("/credentials/{id}/disabled", set_credential_disabled, methods=["POST"])
     router.add_api_route("/credentials/{id}/priority", set_credential_priority, methods=["POST"])
     router.add_api_route("/credentials/{id}/reset", reset_failure_count, methods=["POST"])
+    router.add_api_route("/credentials/{id}/refresh", force_refresh_token, methods=["POST"])
     router.add_api_route("/credentials/{id}/balance", get_credential_balance, methods=["GET"])
     router.add_api_route("/credentials/{id}/group", set_credential_group, methods=["POST"])
     router.add_api_route("/stats", get_request_stats, methods=["GET"])

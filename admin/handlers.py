@@ -79,6 +79,18 @@ async def reset_failure_count(request: Request, id: int) -> JSONResponse:
     )
 
 
+async def force_refresh_token(request: Request, id: int) -> JSONResponse:
+    """POST /credentials/{id}/refresh - 强制刷新凭据 Token"""
+    service = request.app.state.admin_service
+    try:
+        await service.force_refresh_token(id)
+    except AdminServiceError as e:
+        return _error_response(e)
+    return JSONResponse(
+        content=SuccessResponse.new(f"凭据 #{id} Token 已强制刷新").to_dict()
+    )
+
+
 async def reset_all_counters(request: Request) -> JSONResponse:
     """POST /credentials/reset-all"""
     service = request.app.state.admin_service

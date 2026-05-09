@@ -42,6 +42,8 @@ SYSTEM_CHUNKED_POLICY = (
 )
 
 MAX_TOOL_DESCRIPTION_LENGTH = 9216
+# Kiro API 工具名称最大长度限制
+TOOL_NAME_MAX_LEN = 63
 RECENT_HISTORY_WINDOW = 5
 CURRENT_TOOL_RESULT_MAX_CHARS = 16_000
 CURRENT_TOOL_RESULT_MAX_LINES = 300
@@ -70,6 +72,12 @@ class EmptyMessagesError(ConversionError):
 @dataclass
 class ConversionResult:
     conversation_state: ConversationState
+    # 工具名称映射（短名称 → 原始名称），仅当存在超长工具名时非空
+    tool_name_map: Dict[str, str] = None
+
+    def __post_init__(self):
+        if self.tool_name_map is None:
+            self.tool_name_map = {}
 
 
 def configure_converter_limits(
@@ -104,6 +112,18 @@ def map_model(model: str) -> Optional[str]:
     elif "haiku" in m:
         return "claude-haiku-4.5"
     return model
+
+
+def get_context_window_size(model: str) -> int:
+    """根据模型名称返回对应的上下文窗口大小
+
+    复用 map_model 的映射逻辑，确保窗口大小判断与模型映射一致。
+    Kiro 于 2026-03-24 将 Opus 4.6 和 Sonnet 4.6 升级至 1M 上下文。
+    """
+    mapped = map_model(model)
+    if mapped in ("claude-sonnet-4.6", "claude-opus-4.6"):
+        return 1_000_000
+    return 200_000
 
 
 def normalize_json_schema(schema: Any) -> dict:
@@ -178,15 +198,37 @@ def normalize_json_schema(schema: Any) -> dict:
 
 
 def _extract_session_id(user_id: str) -> Optional[str]:
+    """从 metadata.user_id 中提取 session UUID
+
+    支持两种格式:
+    1. 字符串格式: user_xxx__session_<uuid>
+    2. JSON 格式: {"session_id": "<uuid>", ...}
+    """
+    # 先尝试 JSON 解析
+    try:
+        parsed = json.loads(user_id)
+        if isinstance(parsed, dict):
+            sid = parsed.get("session_id")
+            if isinstance(sid, str) and _is_valid_uuid(sid):
+                return sid
+    except (json.JSONDecodeError, TypeError):
+        pass
+
+    # 字符串格式兜底
     idx = user_id.find("session_")
     if idx == -1:
         return None
     session_part = user_id[idx + 8:]
     if len(session_part) >= 36:
         uuid_str = session_part[:36]
-        if uuid_str.count("-") == 4:
+        if _is_valid_uuid(uuid_str):
             return uuid_str
     return None
+
+
+def _is_valid_uuid(s: str) -> bool:
+    """简单验证 UUID 格式（36 字符，包含 4 个连字符）"""
+    return len(s) == 36 and s.count("-") == 4
 
 
 _IMAGE_FORMAT_MAP = {"image/jpeg": "jpeg", "image/png": "png", "image/gif": "gif", "image/webp": "webp"}
@@ -367,8 +409,12 @@ def _process_message_content(
     return "\n".join(part for part in text_parts if part), images, _dedupe_tool_results(tool_results)
 
 
-def _convert_tools(tools: Optional[List[Dict[str, Any]]]) -> List[Tool]:
-    """按 A2 的思路转换工具定义。"""
+def _convert_tools(tools: Optional[List[Dict[str, Any]]], tool_name_map: Dict[str, str]) -> List[Tool]:
+    """按 A2 的思路转换工具定义。
+
+    超长（> 63 字符）的工具名会被自动缩短为 "<前缀>_<8 位 sha256 hex>"，
+    并记录到 tool_name_map，供响应时还原。
+    """
     if not tools:
         logger.info("未提供工具，插入 A2 风格占位工具")
         return [_create_placeholder_tool("no_tool_available")]
@@ -395,9 +441,10 @@ def _convert_tools(tools: Optional[List[Dict[str, Any]]]) -> List[Tool]:
         if len(desc) > MAX_TOOL_DESCRIPTION_LENGTH:
             desc = desc[:MAX_TOOL_DESCRIPTION_LENGTH] + "..."
         schema = normalize_json_schema(t.get("input_schema", {}))
+        mapped_name = _map_tool_name(name, tool_name_map)
         result.append(Tool(
             tool_specification=ToolSpecification(
-                name=name,
+                name=mapped_name,
                 description=desc,
                 input_schema=InputSchema.from_json(schema),
             )
@@ -408,6 +455,26 @@ def _convert_tools(tools: Optional[List[Dict[str, Any]]]) -> List[Tool]:
 
     logger.info("所有工具均被过滤，插入 A2 风格占位工具")
     return [_create_placeholder_tool("no_tool_available")]
+
+
+def _shorten_tool_name(name: str) -> str:
+    """生成确定性短名称：截断前缀 + "_" + 8 位 SHA256 hex"""
+    import hashlib
+    hash_hex = hashlib.sha256(name.encode("utf-8")).hexdigest()
+    hash_suffix = hash_hex[:8]
+    # 54 prefix + 1 underscore + 8 hash = 63
+    prefix_max = TOOL_NAME_MAX_LEN - 1 - 8
+    prefix = name[:prefix_max]
+    return f"{prefix}_{hash_suffix}"
+
+
+def _map_tool_name(name: str, tool_name_map: Dict[str, str]) -> str:
+    """如果名称超长则缩短，并记录映射（short → original）"""
+    if len(name) <= TOOL_NAME_MAX_LEN:
+        return name
+    short = _shorten_tool_name(name)
+    tool_name_map[short] = name
+    return short
 
 
 def _create_placeholder_tool(name: str) -> Tool:
@@ -475,8 +542,8 @@ def _convert_history_user_message(msg: AnthropicMessage, model_id: str, history_
     return Message(HistoryUserMessage(user_input_message=user_msg))
 
 
-def _convert_history_assistant_message(msg: AnthropicMessage) -> Message:
-    return Message(_convert_assistant_message(msg))
+def _convert_history_assistant_message(msg: AnthropicMessage, tool_name_map: Optional[Dict[str, str]] = None) -> Message:
+    return Message(_convert_assistant_message(msg, tool_name_map))
 
 
 def _generate_thinking_prefix(req: MessagesRequest) -> Optional[str]:
@@ -498,8 +565,11 @@ def _has_thinking_tags(content: str) -> bool:
     return "<thinking_mode>" in content or "<max_thinking_length>" in content
 
 
-def _convert_assistant_message(msg: AnthropicMessage) -> HistoryAssistantMessage:
-    """转换 assistant 消息"""
+def _convert_assistant_message(msg: AnthropicMessage, tool_name_map: Optional[Dict[str, str]] = None) -> HistoryAssistantMessage:
+    """转换 assistant 消息
+
+    tool_use 中的长名称会根据 tool_name_map（如果提供）被映射为短名称。
+    """
     thinking_content = ""
     text_content = ""
     tool_uses: List[ToolUseEntry] = []
@@ -521,7 +591,8 @@ def _convert_assistant_message(msg: AnthropicMessage) -> HistoryAssistantMessage
                 name = item.get("name")
                 if tid and name:
                     inp = item.get("input", {})
-                    te = ToolUseEntry(tool_use_id=tid, name=name, input=inp)
+                    mapped_name = _map_tool_name(name, tool_name_map) if tool_name_map is not None else name
+                    te = ToolUseEntry(tool_use_id=tid, name=mapped_name, input=inp)
                     tool_uses.append(te)
 
     if thinking_content:
@@ -540,13 +611,13 @@ def _convert_assistant_message(msg: AnthropicMessage) -> HistoryAssistantMessage
     return HistoryAssistantMessage(assistant_response_message=am)
 
 
-def _merge_assistant_messages(messages: List[AnthropicMessage]) -> HistoryAssistantMessage:
+def _merge_assistant_messages(messages: List[AnthropicMessage], tool_name_map: Optional[Dict[str, str]] = None) -> HistoryAssistantMessage:
     if len(messages) == 1:
-        return _convert_assistant_message(messages[0])
+        return _convert_assistant_message(messages[0], tool_name_map)
     all_tool_uses: List[ToolUseEntry] = []
     content_parts: List[str] = []
     for msg in messages:
-        converted = _convert_assistant_message(msg)
+        converted = _convert_assistant_message(msg, tool_name_map)
         am = converted.assistant_response_message
         if am.content.strip():
             content_parts.append(am.content)
@@ -611,6 +682,7 @@ def _process_history_tools(
 
 def _build_history(
     req: MessagesRequest, messages: List[AnthropicMessage], model_id: str,
+    tool_name_map: Optional[Dict[str, str]] = None,
 ) -> List[Message]:
     """按 A2 风格构建 history。"""
     history: List[Message] = []
@@ -660,7 +732,7 @@ def _build_history(
         if msg.role == "user":
             history.append(_convert_history_user_message(msg, model_id, history_distance))
         elif msg.role == "assistant":
-            history.append(_convert_history_assistant_message(msg))
+            history.append(_convert_history_assistant_message(msg, tool_name_map))
 
     return history
 
@@ -688,14 +760,17 @@ def convert_request(req: MessagesRequest) -> ConversionResult:
         session_id = _extract_session_id(meta.user_id)
     conversation_id = session_id or str(uuid.uuid4())
 
-    # 转换工具定义
-    tools = _convert_tools(req.tools)
+    # 工具名称映射（用于超长名称缩短 + 响应时还原）
+    tool_name_map: Dict[str, str] = {}
 
-    # 构建历史消息
-    history = _build_history(req, messages, model_id)
+    # 转换工具定义（超长名称自动缩短并记录映射）
+    tools = _convert_tools(req.tools, tool_name_map)
+
+    # 构建历史消息（历史中使用的 tool_use 同样需要映射）
+    history = _build_history(req, messages, model_id, tool_name_map)
 
     if last_message_is_assistant:
-        history.append(Message(_convert_assistant_message(messages[-1])))
+        history.append(Message(_convert_assistant_message(messages[-1], tool_name_map)))
 
     if last_message_is_assistant and (not history or not history[-1].is_assistant()):
         history.append(Message(HistoryAssistantMessage(
@@ -745,4 +820,7 @@ def convert_request(req: MessagesRequest) -> ConversionResult:
         chat_trigger_type="MANUAL",
     )
 
-    return ConversionResult(conversation_state=state)
+    if tool_name_map:
+        logger.info("工具名称映射: %d 个超长名称已缩短", len(tool_name_map))
+
+    return ConversionResult(conversation_state=state, tool_name_map=tool_name_map)

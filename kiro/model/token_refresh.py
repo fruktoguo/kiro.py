@@ -54,6 +54,7 @@ class IdcRefreshResponse:
     access_token: str
     refresh_token: Optional[str] = None
     expires_in: Optional[int] = None
+    profile_arn: Optional[str] = None
 
     @classmethod
     def from_dict(cls, data: dict) -> "IdcRefreshResponse":
@@ -61,4 +62,5 @@ class IdcRefreshResponse:
             access_token=data["accessToken"],
             refresh_token=data.get("refreshToken"),
             expires_in=data.get("expiresIn"),
+            profile_arn=data.get("profileArn"),
         )

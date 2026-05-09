@@ -14,7 +14,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from http_client import ProxyConfig, build_client, build_sync_client
 from kiro.machine_id import generate_from_credentials
@@ -30,15 +30,22 @@ from config import Config
 
 logger = logging.getLogger(__name__)
 
+if TYPE_CHECKING:
+    from proxy_runtime import ProxyRuntime
+
 # 每个凭据最大 API 调用失败次数
 MAX_FAILURES_PER_CREDENTIAL = 3
 TRANSIENT_FAILURE_COOLDOWN_SECS = 15
 # 统计数据持久化防抖间隔（秒）
 STATS_SAVE_DEBOUNCE = 30.0
-# IdC Token 刷新所需的 x-amz-user-agent header
-IDC_AMZ_USER_AGENT = "aws-sdk-js/3.738.0 ua/2.1 os/other lang/js md/browser#unknown_unknown api/sso-oidc#3.738.0 m/E KiroIDE"
-# getUsageLimits API 所需的 x-amz-user-agent 前缀
-USAGE_LIMITS_AMZ_USER_AGENT_PREFIX = "aws-sdk-js/1.0.0"
+
+
+class RefreshTokenInvalidError(RuntimeError):
+    """Refresh Token 永久失效错误
+
+    当服务端返回 400 + invalid_grant 时，表示 refreshToken 已被撤销或过期，
+    不应重试，需立即禁用对应凭据。
+    """
 
 
 def _sha256_hex(input_str: str) -> str:
@@ -104,7 +111,15 @@ async def refresh_token(
     config: Config,
     proxy: Optional[ProxyConfig] = None,
 ) -> KiroCredentials:
-    """刷新 Token，根据 auth_method 选择 Social 或 IdC"""
+    """刷新 Token，根据 auth_method 选择 Social 或 IdC
+
+    API Key 凭据不支持 Token 刷新：底层契约级拦截。
+    其他调用点在调用前已显式分流 API Key；仅 force_refresh_token_for 未分流，
+    此处抛错让错误自然传播为 400 BAD_REQUEST。
+    """
+    if credentials.is_api_key_credential():
+        raise RuntimeError("API Key 凭据不支持刷新 Token")
+
     validate_refresh_token(credentials)
 
     auth_method = credentials.auth_method
@@ -155,6 +170,15 @@ async def refresh_social_token(
 
     if response.status_code >= 400:
         body_text = response.text
+
+        # 400 + invalid_grant + Invalid refresh token provided → refreshToken 永久失效
+        if (response.status_code == 400
+                and '"invalid_grant"' in body_text
+                and "Invalid refresh token provided" in body_text):
+            raise RefreshTokenInvalidError(
+                f"Social refreshToken 已失效 (invalid_grant): {body_text}"
+            )
+
         error_map = {
             401: "OAuth 凭证已过期或无效，需要重新认证",
             403: "权限不足，无法刷新 Token",
@@ -197,6 +221,14 @@ async def refresh_idc_token(
 
     region = credentials.effective_auth_region(config)
     refresh_url = f"https://oidc.{region}.amazonaws.com/token"
+    os_name = config.system_version
+    node_version = config.node_version
+
+    x_amz_user_agent = "aws-sdk-js/3.980.0 KiroIDE"
+    user_agent = (
+        f"aws-sdk-js/3.980.0 ua/2.1 os/{os_name} lang/js md/nodejs#{node_version} "
+        f"api/sso-oidc#3.980.0 m/E KiroIDE"
+    )
 
     client = build_client(proxy, timeout_secs=60)
     body = IdcRefreshRequest(
@@ -210,15 +242,13 @@ async def refresh_idc_token(
             refresh_url,
             json=body.to_dict(),
             headers={
-                "Content-Type": "application/json",
-                "Host": f"oidc.{region}.amazonaws.com",
-                "Connection": "keep-alive",
-                "x-amz-user-agent": IDC_AMZ_USER_AGENT,
-                "Accept": "*/*",
-                "Accept-Language": "*",
-                "sec-fetch-mode": "cors",
-                "User-Agent": "node",
-                "Accept-Encoding": "br, gzip, deflate",
+                "content-type": "application/json",
+                "x-amz-user-agent": x_amz_user_agent,
+                "user-agent": user_agent,
+                "host": f"oidc.{region}.amazonaws.com",
+                "amz-sdk-invocation-id": str(uuid.uuid4()),
+                "amz-sdk-request": "attempt=1; max=4",
+                "Connection": "close",
             },
         )
     finally:
@@ -226,6 +256,15 @@ async def refresh_idc_token(
 
     if response.status_code >= 400:
         body_text = response.text
+
+        # 400 + invalid_grant + Invalid refresh token provided → refreshToken 永久失效
+        if (response.status_code == 400
+                and '"invalid_grant"' in body_text
+                and "Invalid refresh token provided" in body_text):
+            raise RefreshTokenInvalidError(
+                f"IdC refreshToken 已失效 (invalid_grant): {body_text}"
+            )
+
         error_map = {
             401: "IdC 凭证已过期或无效，需要重新认证",
             403: "权限不足，无法刷新 Token",
@@ -245,6 +284,9 @@ async def refresh_idc_token(
     if data.expires_in is not None:
         expires_at = _utc_now() + timedelta(seconds=data.expires_in)
         new_cred.expires_at = expires_at.isoformat()
+    # 同步更新 profile_arn（如果 IdC 响应中包含）
+    if data.profile_arn:
+        new_cred.profile_arn = data.profile_arn
     return new_cred
 
 
@@ -265,6 +307,8 @@ async def get_usage_limits(
     if machine_id is None:
         raise RuntimeError("无法生成 machineId")
     kiro_version = config.kiro_version
+    os_name = config.system_version
+    node_version = config.node_version
 
     url = f"https://{host}/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST"
     if credentials.profile_arn:
@@ -272,25 +316,27 @@ async def get_usage_limits(
         url += f"&profileArn={quote(credentials.profile_arn, safe='')}"
 
     user_agent = (
-        f"aws-sdk-js/1.0.0 ua/2.1 os/darwin#24.6.0 lang/js md/nodejs#22.21.1 "
+        f"aws-sdk-js/1.0.0 ua/2.1 os/{os_name} lang/js md/nodejs#{node_version} "
         f"api/codewhispererruntime#1.0.0 m/N,E KiroIDE-{kiro_version}-{machine_id}"
     )
-    amz_user_agent = f"{USAGE_LIMITS_AMZ_USER_AGENT_PREFIX} KiroIDE-{kiro_version}-{machine_id}"
+    amz_user_agent = f"aws-sdk-js/1.0.0 KiroIDE-{kiro_version}-{machine_id}"
+
+    headers = {
+        "x-amz-user-agent": amz_user_agent,
+        "user-agent": user_agent,
+        "host": host,
+        "amz-sdk-invocation-id": str(uuid.uuid4()),
+        "amz-sdk-request": "attempt=1; max=1",
+        "Authorization": f"Bearer {token}",
+        "Connection": "close",
+    }
+    # API Key 凭据补齐 tokentype 头部
+    if credentials.is_api_key_credential():
+        headers["tokentype"] = "API_KEY"
 
     client = build_client(proxy, timeout_secs=60)
     try:
-        response = await client.get(
-            url,
-            headers={
-                "x-amz-user-agent": amz_user_agent,
-                "User-Agent": user_agent,
-                "host": host,
-                "amz-sdk-invocation-id": str(uuid.uuid4()),
-                "amz-sdk-request": "attempt=1; max=1",
-                "Authorization": f"Bearer {token}",
-                "Connection": "close",
-            },
-        )
+        response = await client.get(url, headers=headers)
     finally:
         await client.aclose()
 
@@ -317,10 +363,17 @@ async def get_usage_limits(
 class TokenManager:
     """单凭据 Token 管理器"""
 
-    def __init__(self, config: Config, credentials: KiroCredentials, proxy: Optional[ProxyConfig] = None):
+    def __init__(
+        self,
+        config: Config,
+        credentials: KiroCredentials,
+        proxy: Optional[ProxyConfig] = None,
+        proxy_runtime: Optional["ProxyRuntime"] = None,
+    ):
         self._config = config
         self._credentials = credentials
         self._proxy = proxy
+        self._proxy_runtime = proxy_runtime
 
     @property
     def credentials(self) -> KiroCredentials:
@@ -333,7 +386,7 @@ class TokenManager:
     async def ensure_valid_token(self) -> str:
         """确保获取有效的访问 Token，过期时自动刷新"""
         if is_token_expired(self._credentials) or is_token_expiring_soon(self._credentials):
-            self._credentials = await refresh_token(self._credentials, self._config, self._proxy)
+            self._credentials = await refresh_token(self._credentials, self._config, self._resolve_proxy(self._credentials))
             if is_token_expired(self._credentials):
                 raise RuntimeError("刷新后的 Token 仍然无效或已过期")
         if not self._credentials.access_token:
@@ -342,7 +395,12 @@ class TokenManager:
 
     async def get_usage_limits(self) -> UsageLimitsResponse:
         token = await self.ensure_valid_token()
-        return await get_usage_limits(self._credentials, self._config, token, self._proxy)
+        return await get_usage_limits(self._credentials, self._config, token, self._resolve_proxy(self._credentials))
+
+    def _resolve_proxy(self, credentials: KiroCredentials) -> Optional[ProxyConfig]:
+        if self._proxy_runtime:
+            return self._proxy_runtime.resolve_for_credentials(credentials)
+        return credentials.effective_proxy(self._proxy)
 
 
 # ============================================================================
@@ -353,6 +411,8 @@ class _DisabledReason:
     MANUAL = "manual"
     TOO_MANY_FAILURES = "too_many_failures"
     QUOTA_EXCEEDED = "quota_exceeded"
+    INVALID_REFRESH_TOKEN = "invalid_refresh_token"
+    INVALID_CONFIG = "invalid_config"
 
 
 @dataclass
@@ -464,11 +524,13 @@ class MultiTokenManager:
         config: Config,
         credentials: list[KiroCredentials],
         proxy: Optional[ProxyConfig] = None,
+        proxy_runtime: Optional["ProxyRuntime"] = None,
         credentials_path: Optional[Path] = None,
         is_multiple_format: bool = False,
     ):
         self._config = config
         self._proxy = proxy
+        self._proxy_runtime = proxy_runtime
         self._credentials_path = credentials_path
         self._is_multiple_format = is_multiple_format
 
@@ -491,11 +553,32 @@ class MultiTokenManager:
                 if mid:
                     cred.machine_id = mid
                     has_new_machine_ids = True
+
+            # 校验配置一致性：authMethod=api_key 但缺少 kiroApiKey → 标记 InvalidConfig 并禁用
+            # 避免 try_ensure_token 在重试循环中反复触发
+            is_invalid_api_key_config = (
+                cred.auth_method
+                and cred.auth_method.lower() in ("api_key", "apikey")
+                and not cred.kiro_api_key
+            )
+
+            initial_disabled = cred.disabled or bool(is_invalid_api_key_config)
+            if is_invalid_api_key_config and not cred.disabled:
+                logger.error(
+                    "凭据 #%d authMethod=api_key 但未提供 kiroApiKey，已自动禁用（InvalidConfig）",
+                    cid,
+                )
+                initial_reason = _DisabledReason.INVALID_CONFIG
+            elif cred.disabled:
+                initial_reason = _DisabledReason.MANUAL
+            else:
+                initial_reason = None
+
             entries.append(_CredentialEntry(
                 id=cid,
                 credentials=cred.clone(),
-                disabled=cred.disabled,
-                disabled_reason=_DisabledReason.MANUAL if cred.disabled else None,
+                disabled=initial_disabled,
+                disabled_reason=initial_reason,
             ))
 
         # 检测重复 ID
@@ -508,8 +591,13 @@ class MultiTokenManager:
         if dup_ids:
             raise ValueError(f"检测到重复的凭据 ID: {dup_ids}")
 
-        # 选择初始凭据
-        initial_id = min((e for e in entries), key=lambda e: e.credentials.priority).id if entries else 0
+        # 选择初始凭据（排除已禁用条目，确保管理面板状态快照与运行时一致）
+        enabled_entries = [e for e in entries if not e.disabled]
+        initial_id = (
+            min(enabled_entries, key=lambda e: e.credentials.priority).id
+            if enabled_entries
+            else (entries[0].id if entries else 0)
+        )
 
         self._entries = entries
         self._current_id = initial_id
@@ -561,6 +649,11 @@ class MultiTokenManager:
     def config(self) -> Config:
         return self._config
 
+    def _resolve_proxy_for_credentials(self, credentials: KiroCredentials) -> Optional[ProxyConfig]:
+        if self._proxy_runtime:
+            return self._proxy_runtime.resolve_for_credentials(credentials)
+        return credentials.effective_proxy(self._proxy)
+
     def credentials(self) -> KiroCredentials:
         with self._lock:
             for e in self._entries:
@@ -575,6 +668,24 @@ class MultiTokenManager:
     def available_count(self) -> int:
         with self._lock:
             return sum(1 for e in self._entries if not e.disabled)
+
+    @staticmethod
+    def _credential_identity_token(cred: KiroCredentials) -> Optional[str]:
+        """返回凭据的"身份字段"用于前端展示/去重
+
+        - OAuth 凭据：refreshToken 的 sha256 前缀
+        - API Key 凭据：脱敏后的明文（前 4 + *** + 后 4）
+        """
+        if cred.is_api_key_credential():
+            k = cred.kiro_api_key
+            if not k:
+                return None
+            if k.isascii() and len(k) > 16:
+                return f"{k[:4]}...{k[-4:]}"
+            return "***"
+        if cred.refresh_token:
+            return _sha256_hex(cred.refresh_token)
+        return None
 
     def _model_is_free(self, model: str) -> bool:
         """判断模型是否在免费列表中（支持 Kiro 内部 ID 和 Anthropic ID 两种格式匹配）"""
@@ -724,13 +835,28 @@ class MultiTokenManager:
             try:
                 ctx = await self._try_ensure_token(cid, cred)
                 return ctx
+            except RefreshTokenInvalidError as e:
+                # refreshToken 永久失效 → 立即禁用，不累计重试
+                logger.warning("凭据 #%d refreshToken 永久失效: %s", cid, e)
+                self.report_refresh_token_invalid(cid)
+                tried_count += 1
             except Exception as e:
                 logger.warning("凭据 #%d Token 刷新失败，尝试下一个凭据: %s", cid, e)
                 self.report_failure(cid)
                 tried_count += 1
 
     async def _try_ensure_token(self, cid: int, credentials: KiroCredentials) -> CallContext:
-        """尝试使用指定凭据获取有效 Token（双重检查锁定）"""
+        """尝试使用指定凭据获取有效 Token（双重检查锁定）
+
+        API Key 凭据直接使用 kiro_api_key 作为 Bearer Token，无需刷新。
+        """
+        # API Key 凭据：直接使用 kiro_api_key 作为 Token
+        if credentials.is_api_key_credential():
+            api_key = credentials.kiro_api_key
+            if not api_key:
+                raise RuntimeError("API Key 凭据缺少 kiroApiKey")
+            return CallContext(id=cid, credentials=credentials, token=api_key)
+
         needs_refresh = is_token_expired(credentials) or is_token_expiring_soon(credentials)
 
         if needs_refresh:
@@ -746,7 +872,7 @@ class MultiTokenManager:
                         raise RuntimeError(f"凭据 #{cid} 不存在")
 
                 if is_token_expired(current_creds) or is_token_expiring_soon(current_creds):
-                    effective_proxy = current_creds.effective_proxy(self._proxy)
+                    effective_proxy = self._resolve_proxy_for_credentials(current_creds)
                     new_creds = await refresh_token(current_creds, self._config, effective_proxy)
                     if is_token_expired(new_creds):
                         raise RuntimeError("刷新后的 Token 仍然无效或已过期")
@@ -913,9 +1039,81 @@ class MultiTokenManager:
                 return True
             return any(e.id == self._current_id and not e.disabled for e in self._entries)
 
+    def report_refresh_token_invalid(self, cid: int) -> bool:
+        """报告指定凭据的 refreshToken 永久失效（invalid_grant）
+
+        立即禁用凭据，不累计、不重试。
+        返回是否还有可用凭据。
+        """
+        with self._lock:
+            entry = None
+            for e in self._entries:
+                if e.id == cid:
+                    entry = e
+                    break
+            if entry is None:
+                return any(not e.disabled for e in self._entries)
+            if entry.disabled:
+                return any(not e.disabled for e in self._entries)
+
+            entry.last_used_at = _utc_now().isoformat()
+            entry.disabled = True
+            entry.disabled_reason = _DisabledReason.INVALID_REFRESH_TOKEN
+            logger.error(
+                "凭据 #%d refreshToken 已失效 (invalid_grant)，已立即禁用", cid
+            )
+
+            candidates = [e for e in self._entries if not e.disabled]
+            if candidates:
+                best = min(candidates, key=lambda e: e.credentials.priority)
+                self._current_id = best.id
+                logger.info("已切换到凭据 #%d（优先级 %d）", best.id, best.credentials.priority)
+                result = True
+            else:
+                logger.error("所有凭据均已禁用！")
+                result = False
+        self._save_stats_debounced()
+        return result
+
+    async def force_refresh_token_for(self, cid: int) -> None:
+        """强制刷新指定凭据的 Token（Admin API / accessToken 失效场景）
+
+        无条件调用上游 API 重新获取 access token，不检查是否过期。
+        适用于排查问题、Token 异常但未过期、主动更新凭据状态等场景。
+        API Key 凭据不支持刷新，直接抛错。
+        """
+        with self._lock:
+            entry = None
+            for e in self._entries:
+                if e.id == cid:
+                    entry = e
+                    break
+            if entry is None:
+                raise ValueError(f"凭据不存在: {cid}")
+            credentials = entry.credentials.clone()
+
+        # 获取刷新锁防止并发刷新
+        async with self._refresh_lock:
+            effective_proxy = self._resolve_proxy_for_credentials(credentials)
+            new_creds = await refresh_token(credentials, self._config, effective_proxy)
+
+            with self._lock:
+                for e in self._entries:
+                    if e.id == cid:
+                        e.credentials = new_creds.clone()
+                        e.failure_count = 0
+                        break
+
+        try:
+            self.persist_credentials()
+        except Exception as e:
+            logger.warning("强制刷新 Token 后持久化失败: %s", e)
+
+        logger.info("凭据 #%d Token 已强制刷新", cid)
+
     async def get_usage_limits(self) -> UsageLimitsResponse:
         ctx = await self.acquire_context(None)
-        effective_proxy = ctx.credentials.effective_proxy(self._proxy)
+        effective_proxy = self._resolve_proxy_for_credentials(ctx.credentials)
         return await get_usage_limits(ctx.credentials, self._config, ctx.token, effective_proxy)
 
     # ========================================================================
@@ -942,7 +1140,7 @@ class MultiTokenManager:
                     auth_method=am,
                     has_profile_arn=e.credentials.profile_arn is not None,
                     expires_at=e.credentials.expires_at,
-                    refresh_token_hash=_sha256_hex(e.credentials.refresh_token) if e.credentials.refresh_token else None,
+                    refresh_token_hash=self._credential_identity_token(e.credentials),
                     email=e.credentials.email,
                     success_count=e.success_count,
                     session_count=e.session_count,
@@ -989,6 +1187,12 @@ class MultiTokenManager:
     def reset_and_enable(self, cid: int):
         with self._lock:
             entry = self._find_entry(cid)
+            # 拒绝恢复 InvalidConfig 凭据：防止重入错误路径
+            # 这类凭据（authMethod=api_key 但缺少 kiroApiKey）恢复后会再次触发错误
+            if entry.disabled_reason == _DisabledReason.INVALID_CONFIG:
+                raise ValueError(
+                    f"凭据 #{cid} 配置无效（InvalidConfig），请修正 credentials.json 后重启服务"
+                )
             entry.failure_count = 0
             entry.disabled = False
             entry.disabled_reason = None
@@ -1012,37 +1216,46 @@ class MultiTokenManager:
         self.save_stats()
 
     async def get_usage_limits_for(self, cid: int) -> UsageLimitsResponse:
-        """获取指定凭据的使用额度"""
+        """获取指定凭据的使用额度
+
+        API Key 凭据直接使用 kiro_api_key 作为 Token，无需刷新。
+        """
         with self._lock:
             entry = self._find_entry(cid)
             cred = entry.credentials.clone()
 
-        needs_refresh = is_token_expired(cred) or is_token_expiring_soon(cred)
-        if needs_refresh:
-            async with self._refresh_lock:
-                with self._lock:
-                    current_cred = self._find_entry(cid).credentials.clone()
-                if is_token_expired(current_cred) or is_token_expiring_soon(current_cred):
-                    effective_proxy = current_cred.effective_proxy(self._proxy)
-                    new_cred = await refresh_token(current_cred, self._config, effective_proxy)
-                    with self._lock:
-                        self._find_entry(cid).credentials = new_cred.clone()
-                    try:
-                        self.persist_credentials()
-                    except Exception as e:
-                        logger.warning("Token 刷新后持久化失败: %s", e)
-                    token = new_cred.access_token
-                else:
-                    token = current_cred.access_token
+        # API Key 凭据：直接使用 kiroApiKey 作为 token
+        if cred.is_api_key_credential():
+            token = cred.kiro_api_key
+            if not token:
+                raise RuntimeError("API Key 凭据缺少 kiroApiKey")
         else:
-            token = cred.access_token
+            needs_refresh = is_token_expired(cred) or is_token_expiring_soon(cred)
+            if needs_refresh:
+                async with self._refresh_lock:
+                    with self._lock:
+                        current_cred = self._find_entry(cid).credentials.clone()
+                    if is_token_expired(current_cred) or is_token_expiring_soon(current_cred):
+                        effective_proxy = self._resolve_proxy_for_credentials(current_cred)
+                        new_cred = await refresh_token(current_cred, self._config, effective_proxy)
+                        with self._lock:
+                            self._find_entry(cid).credentials = new_cred.clone()
+                        try:
+                            self.persist_credentials()
+                        except Exception as e:
+                            logger.warning("Token 刷新后持久化失败: %s", e)
+                        token = new_cred.access_token
+                    else:
+                        token = current_cred.access_token
+            else:
+                token = cred.access_token
 
-        if not token:
-            raise RuntimeError("凭据无 access_token")
+            if not token:
+                raise RuntimeError("凭据无 access_token")
 
         with self._lock:
             cred = self._find_entry(cid).credentials.clone()
-        effective_proxy = cred.effective_proxy(self._proxy)
+        effective_proxy = self._resolve_proxy_for_credentials(cred)
         usage = await get_usage_limits(cred, self._config, token, effective_proxy)
 
         # 更新订阅等级 + 余额快照（持久化到凭据文件）
@@ -1073,22 +1286,47 @@ class MultiTokenManager:
         return usage
 
     async def add_credential(self, new_cred: KiroCredentials) -> int:
-        """添加新凭据，验证有效性后分配 ID 并持久化"""
-        validate_refresh_token(new_cred)
+        """添加新凭据，验证有效性后分配 ID 并持久化
 
-        # 重复检测
-        new_rt = new_cred.refresh_token
-        if not new_rt:
-            raise ValueError("缺少 refreshToken")
-        new_hash = _sha256_hex(new_rt)
-        with self._lock:
-            for e in self._entries:
-                if e.credentials.refresh_token and _sha256_hex(e.credentials.refresh_token) == new_hash:
-                    raise ValueError("凭据已存在（refreshToken 重复）")
+        支持 OAuth 凭据（含 refreshToken）和 API Key 凭据（含 kiroApiKey）两种类型。
+        - OAuth: 基于 refreshToken 的 SHA-256 哈希去重，调用 refresh_token 验证有效性
+        - API Key: 基于 kiroApiKey 的 SHA-256 哈希去重，跳过网络验证
+        """
+        is_api_key = new_cred.is_api_key_credential()
 
-        # 验证凭据有效性
-        effective_proxy = new_cred.effective_proxy(self._proxy)
-        validated = await refresh_token(new_cred, self._config, effective_proxy)
+        if is_api_key:
+            # API Key 凭据：基本验证
+            api_key = new_cred.kiro_api_key
+            if not api_key:
+                raise ValueError("缺少 kiroApiKey")
+            if not api_key.strip():
+                raise ValueError("kiroApiKey 为空")
+
+            # 基于 kiroApiKey 哈希检测重复
+            new_hash = _sha256_hex(api_key)
+            with self._lock:
+                for e in self._entries:
+                    if e.credentials.kiro_api_key and _sha256_hex(e.credentials.kiro_api_key) == new_hash:
+                        raise ValueError("凭据已存在（kiroApiKey 重复）")
+
+            # API Key 凭据无需网络验证，直接使用原凭据
+            validated = new_cred.clone()
+        else:
+            # OAuth 凭据：基本验证
+            validate_refresh_token(new_cred)
+
+            new_rt = new_cred.refresh_token
+            if not new_rt:
+                raise ValueError("缺少 refreshToken")
+            new_hash = _sha256_hex(new_rt)
+            with self._lock:
+                for e in self._entries:
+                    if e.credentials.refresh_token and _sha256_hex(e.credentials.refresh_token) == new_hash:
+                        raise ValueError("凭据已存在（refreshToken 重复）")
+
+            # 验证凭据有效性（触发一次刷新）
+            effective_proxy = self._resolve_proxy_for_credentials(new_cred)
+            validated = await refresh_token(new_cred, self._config, effective_proxy)
 
         with self._lock:
             new_id = max((e.id for e in self._entries), default=0) + 1
@@ -1096,8 +1334,12 @@ class MultiTokenManager:
         validated.id = new_id
         validated.priority = new_cred.priority
         validated.auth_method = new_cred.auth_method
-        if validated.auth_method and validated.auth_method.lower() in ("builder-id", "iam"):
-            validated.auth_method = "idc"
+        if validated.auth_method:
+            low = validated.auth_method.lower()
+            if low in ("builder-id", "iam"):
+                validated.auth_method = "idc"
+            elif low in ("api_key", "apikey"):
+                validated.auth_method = "api_key"
         validated.client_id = new_cred.client_id
         validated.client_secret = new_cred.client_secret
         validated.region = new_cred.region
@@ -1108,13 +1350,14 @@ class MultiTokenManager:
         validated.proxy_url = new_cred.proxy_url
         validated.proxy_username = new_cred.proxy_username
         validated.proxy_password = new_cred.proxy_password
+        validated.kiro_api_key = new_cred.kiro_api_key
 
         with self._lock:
             self._entries.append(_CredentialEntry(
                 id=new_id, credentials=validated,
             ))
         self.persist_credentials()
-        logger.info("成功添加凭据 #%d", new_id)
+        logger.info("成功添加凭据 #%d（%s）", new_id, "API Key" if is_api_key else "OAuth")
         return new_id
 
     def delete_credential(self, cid: int):

@@ -315,7 +315,7 @@ class AdminService:
         )
 
     async def add_credential(self, req: AddCredentialRequest) -> AddCredentialResponse:
-        """添加新凭据"""
+        """添加新凭据（支持 OAuth 和 API Key 两种类型）"""
         email = req.email
         new_cred = KiroCredentials(
             refresh_token=req.refresh_token,
@@ -332,13 +332,14 @@ class AdminService:
             proxy_username=req.proxy_username,
             proxy_password=req.proxy_password,
             disabled=False,
+            kiro_api_key=req.kiro_api_key,
         )
         try:
             credential_id = await self.token_manager.add_credential(new_cred)
         except Exception as e:
             raise self._classify_add_error(e)
 
-        # 主动获取订阅等级
+        # 主动获取订阅等级（API Key 凭据同样支持）
         try:
             await self.token_manager.get_usage_limits_for(credential_id)
         except Exception as e:
@@ -730,10 +731,43 @@ class AdminService:
             "缺少 refreshToken", "refreshToken 为空", "refreshToken 已被截断",
             "凭据已存在", "refreshToken 重复", "凭证已过期或无效",
             "权限不足", "已被限流",
+            "缺少 kiroApiKey", "kiroApiKey 为空", "kiroApiKey 重复",
         ]
         if any(kw in msg for kw in invalid_keywords):
             return InvalidCredentialError(msg)
         if any(kw in msg for kw in ("error trying to connect", "connection", "timeout")):
+            return UpstreamError(msg)
+        return InternalError(msg)
+
+    async def force_refresh_token(self, id: int) -> None:
+        """强制刷新指定凭据的 Token（Admin API）
+
+        API Key 凭据不支持刷新，会返回 400 InvalidCredential。
+        """
+        try:
+            await self.token_manager.force_refresh_token_for(id)
+        except ValueError as e:
+            msg = str(e)
+            if "凭据不存在" in msg:
+                raise NotFoundError(id)
+            raise InvalidCredentialError(msg)
+        except Exception as e:
+            raise self._classify_refresh_error(e, id)
+
+    def _classify_refresh_error(self, e: Exception, id: int) -> AdminServiceError:
+        msg = str(e)
+        if "凭据不存在" in msg:
+            return NotFoundError(id)
+        # API Key 凭据不支持刷新 → 客户端请求错误
+        if "API Key 凭据不支持刷新" in msg:
+            return InvalidCredentialError(msg)
+        # 上游错误特征
+        upstream_keywords = [
+            "凭证已过期或无效", "权限不足", "已被限流",
+            "AWS OAuth 服务暂时不可用", "AWS OIDC 服务暂时不可用",
+            "error trying to connect", "connection", "timeout",
+        ]
+        if any(kw in msg for kw in upstream_keywords):
             return UpstreamError(msg)
         return InternalError(msg)
 

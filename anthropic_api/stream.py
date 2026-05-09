@@ -14,6 +14,7 @@ logger = logging.getLogger(__name__)
 # 需要跳过的包裹字符（当 thinking 标签被这些字符包裹时，认为是引用而非真正标签）
 QUOTE_CHARS = {ord(c) for c in '`"\'\\#!@$%^&*()-_=+[]{};:<>,.?/'}
 
+# 默认上下文窗口兜底（当动态解析失败时回退）
 CONTEXT_WINDOW_SIZE = 200_000
 
 
@@ -82,6 +83,54 @@ def _find_real_thinking_end_tag_at_buffer_end(buffer: str) -> Optional[int]:
         if buffer[after_pos:].strip() == "":
             return pos
         search_start = pos + 1
+
+
+def extract_thinking_from_complete_text(text: str) -> tuple:
+    """从完整文本中提取 thinking 块（用于非流式响应）
+
+    使用与流式处理相同的标签检测逻辑（引用字符过滤），确保一致性。
+    非流式场景下文本已完整，无需处理跨 chunk 分割问题。
+
+    返回值：
+    - (thinking_content, remaining_text) — 检测到有效 thinking 块
+    - (None, original_text) — 未检测到或标签不完整，原样返回
+    """
+    start_pos = find_real_thinking_start_tag(text)
+    if start_pos is None:
+        return None, text
+
+    before = text[:start_pos]
+    after_open_start = start_pos + len("<thinking>")
+    after_open = text[after_open_start:]
+
+    # 查找结束标签：优先匹配带 \n\n 后缀的，退而使用末尾匹配
+    end_pos = find_real_thinking_end_tag(after_open)
+    if end_pos is not None:
+        thinking_raw = after_open[:end_pos]
+        text_after = after_open[end_pos + len("</thinking>\n\n"):]
+    else:
+        end_pos_tail = _find_real_thinking_end_tag_at_buffer_end(after_open)
+        if end_pos_tail is None:
+            return None, text
+        thinking_raw = after_open[:end_pos_tail]
+        after_tag = end_pos_tail + len("</thinking>")
+        text_after = after_open[after_tag:].lstrip()
+
+    # 剥离开头的换行符（与流式处理一致：模型输出 <thinking>\n）
+    if thinking_raw.startswith("\n"):
+        thinking_content = thinking_raw[1:]
+    else:
+        thinking_content = thinking_raw
+
+    # 组装剩余文本：跳过纯空白的 before 部分
+    remaining = ""
+    if before.strip():
+        remaining += before
+    remaining += text_after
+
+    if not thinking_content:
+        return None, remaining
+    return thinking_content, remaining
 
 
 @dataclass
@@ -208,7 +257,8 @@ def estimate_tokens(text: str) -> int:
 class StreamContext:
     """流处理上下文 - 处理 Kiro 事件并转换为 Anthropic SSE 事件"""
 
-    def __init__(self, model: str, input_tokens: int, thinking_enabled: bool = False):
+    def __init__(self, model: str, input_tokens: int, thinking_enabled: bool = False,
+                 tool_name_map: Optional[Dict[str, str]] = None):
         self.state_manager = SseStateManager()
         self.model = model
         self.message_id = f"msg_{uuid.uuid4().hex}"
@@ -217,6 +267,8 @@ class StreamContext:
         self.context_total_tokens: Optional[int] = None
         self.output_tokens = 0
         self.tool_block_indices: Dict[str, int] = {}
+        # 工具名称反向映射（短名称 → 原始名称），用于响应时还原
+        self.tool_name_map: Dict[str, str] = tool_name_map or {}
         self.thinking_enabled = thinking_enabled
         self.thinking_buffer = ""
         self.in_thinking_block = False
@@ -289,7 +341,9 @@ class StreamContext:
                 return []
         elif isinstance(event, ContextUsageEvent):
             self._last_assistant_content = None
-            actual = int(event.context_usage_percentage * CONTEXT_WINDOW_SIZE / 100.0)
+            from .converter import get_context_window_size
+            window = get_context_window_size(self.model)
+            actual = int(event.context_usage_percentage * window / 100.0)
             self.context_total_tokens = actual
             if event.context_usage_percentage >= 100.0:
                 self.state_manager.set_stop_reason("model_context_window_exceeded")
@@ -471,12 +525,13 @@ class StreamContext:
                 block_index = self.state_manager.next_block_index()
                 self.tool_block_indices[tool_use.tool_use_id] = block_index
 
-            # content_block_start
+            # content_block_start（还原原始工具名称，如果有映射）
+            display_name = self.tool_name_map.get(tool_use.name, tool_use.name)
             events.extend(self.state_manager.handle_content_block_start(block_index, "tool_use", {
                 "type": "content_block_start", "index": block_index,
                 "content_block": {
                     "type": "tool_use", "id": tool_use.tool_use_id,
-                    "name": tool_use.name, "input": {},
+                    "name": display_name, "input": {},
                 },
             }))
 
@@ -597,8 +652,9 @@ class BufferedStreamContext:
     缓冲所有事件直到流结束，然后用 contextUsageEvent 的正确 input_tokens 更正 message_start。
     """
 
-    def __init__(self, model: str, estimated_input_tokens: int, thinking_enabled: bool = False):
-        self.inner = StreamContext(model, estimated_input_tokens, thinking_enabled)
+    def __init__(self, model: str, estimated_input_tokens: int, thinking_enabled: bool = False,
+                 tool_name_map: Optional[Dict[str, str]] = None):
+        self.inner = StreamContext(model, estimated_input_tokens, thinking_enabled, tool_name_map)
         self.event_buffer: List[SseEvent] = []
         self.estimated_input_tokens = estimated_input_tokens
         self._initial_events_generated = False

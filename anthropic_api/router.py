@@ -25,17 +25,20 @@ def create_router() -> APIRouter:
     return router
 
 
-def create_router_with_provider(api_key: str, provider=None, profile_arn: str = None) -> APIRouter:
-    """创建带 Provider 的 Anthropic API 路由（供 main.py 使用）"""
+def create_router_with_provider(api_key: str, provider=None, extract_thinking: bool = True) -> APIRouter:
+    """创建带 Provider 的 Anthropic API 路由（供 main.py 使用）
+
+    注意: profile_arn 不再传入，由 provider 层根据实际凭据动态注入到请求体。
+    """
     router = create_router()
     # 将 state 附加到 router，main.py 负责挂载中间件
-    router.state = AppState(api_key=api_key, kiro_provider=provider, profile_arn=profile_arn)
+    router.state = AppState(api_key=api_key, kiro_provider=provider, extract_thinking=extract_thinking)
     return router
 
 
-def setup_anthropic_routes(app, api_key: str, kiro_provider=None, profile_arn: str = None):
+def setup_anthropic_routes(app, api_key: str, kiro_provider=None, extract_thinking: bool = True):
     """配置 Anthropic API 路由到 FastAPI 应用"""
-    state = AppState(api_key=api_key, kiro_provider=kiro_provider, profile_arn=profile_arn)
+    state = AppState(api_key=api_key, kiro_provider=kiro_provider, extract_thinking=extract_thinking)
 
     router = create_router()
     app.include_router(router)

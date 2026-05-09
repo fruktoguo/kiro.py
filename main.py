@@ -16,6 +16,7 @@ from http_client import ProxyConfig
 from kiro.model.credentials import KiroCredentials, CredentialsConfig
 from kiro.token_manager import MultiTokenManager
 from kiro.provider import KiroProvider
+from proxy_runtime import ProxyPoolManager, ProxyRuntime
 from anthropic_api.router import create_router_with_provider
 from anthropic_api.middleware import AppState, AuthMiddleware, add_cors_middleware
 from anthropic_api.converter import configure_converter_limits
@@ -79,12 +80,20 @@ def main():
             proxy_config = proxy_config.with_auth(config.proxy_username, config.proxy_password)
         logger.info("已配置 HTTP 代理: %s", config.proxy_url)
 
+    proxy_pool_path = Path(cred_path).resolve().parent / "proxy_pool_plugin.json"
+    proxy_pool_manager = ProxyPoolManager(proxy_pool_path)
+    proxy_runtime = ProxyRuntime(
+        global_proxy=proxy_config,
+        pool_manager=proxy_pool_manager,
+    )
+
     # 创建 MultiTokenManager 和 KiroProvider
     try:
         token_manager = MultiTokenManager(
             config=config,
             credentials=credentials_list,
             proxy=proxy_config,
+            proxy_runtime=proxy_runtime,
             credentials_path=Path(cred_path),
             is_multiple_format=is_multiple_format,
         )
@@ -92,13 +101,18 @@ def main():
         logger.error("创建 Token 管理器失败: %s", e)
         sys.exit(1)
 
-    kiro_provider = KiroProvider(token_manager=token_manager, proxy=proxy_config)
+    kiro_provider = KiroProvider(
+        token_manager=token_manager,
+        proxy=proxy_config,
+        proxy_runtime=proxy_runtime,
+    )
 
     token_counter.init_config(token_counter.CountTokensConfig(
         api_url=config.count_tokens_api_url,
         api_key=config.count_tokens_api_key,
         auth_type=config.count_tokens_auth_type,
         proxy=proxy_config,
+        proxy_runtime=proxy_runtime,
     ))
     configure_request_limits(
         max_bytes=config.request_max_bytes,
@@ -126,17 +140,20 @@ def main():
 
     # 构建 FastAPI 应用
     app = FastAPI()
+    app.state.proxy_pool_manager = proxy_pool_manager
+    app.state.proxy_runtime = proxy_runtime
 
     # 挂载 Anthropic API 路由
+    # profile_arn 由 provider 层根据实际凭据动态注入（修复刷新/切换后携带过期 ARN 的问题）
     anthropic_state = AppState(
         api_key=api_key,
         kiro_provider=kiro_provider,
-        profile_arn=first_credentials.profile_arn,
+        extract_thinking=config.extract_thinking,
     )
     anthropic_router = create_router_with_provider(
         api_key=api_key,
         provider=kiro_provider,
-        profile_arn=first_credentials.profile_arn,
+        extract_thinking=config.extract_thinking,
     )
     app.include_router(anthropic_router)
     app.add_middleware(AuthMiddleware, state=anthropic_state)
@@ -162,6 +179,8 @@ def main():
         admin_app = FastAPI()
         admin_app.include_router(admin_router)
         admin_app.state.admin_service = admin_service
+        admin_app.state.proxy_pool_manager = proxy_pool_manager
+        admin_app.state.proxy_runtime = proxy_runtime
 
         # 加载插件（路由注册到 admin_app，共享 admin 认证）
         loaded_plugins = load_plugins(admin_app)

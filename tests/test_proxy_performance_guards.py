@@ -130,17 +130,17 @@ class ProxyPerformanceGuardsTest(unittest.IsolatedAsyncioTestCase):
 class LightweightAuthMiddlewareTest(unittest.TestCase):
     def test_anthropic_auth_middleware_accepts_valid_key_and_sets_state(self):
         app = FastAPI()
-        app.add_middleware(AuthMiddleware, state=AppState(api_key="secret", profile_arn="arn:test"))
+        app.add_middleware(AuthMiddleware, state=AppState(api_key="secret", extract_thinking=True))
 
         @app.get("/v1/ping")
         async def ping(request: Request):
-            return {"profileArn": request.state.app_state.profile_arn}
+            return {"extractThinking": request.state.app_state.extract_thinking}
 
         client = TestClient(app)
         response = client.get("/v1/ping", headers={"x-api-key": "secret"})
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()["profileArn"], "arn:test")
+        self.assertEqual(response.json()["extractThinking"], True)
 
     def test_admin_auth_middleware_rejects_invalid_key(self):
         app = FastAPI()

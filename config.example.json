@@ -2,10 +2,10 @@
   "host": "0.0.0.0",
   "port": 8990,
   "region": "us-east-1",
-  "kiroVersion": "0.10.0",
+  "kiroVersion": "0.11.107",
   "apiKey": "your-api-key-here",
   "systemVersion": "win32#10.0.22631",
-  "nodeVersion": "22.21.1",
+  "nodeVersion": "22.22.0",
   "tlsBackend": "rustls",
   "countTokensAuthType": "x-api-key",
   "requestMaxBytes": 8388608,
@@ -18,6 +18,10 @@
   "toolResultCurrentMaxLines": 300,
   "toolResultHistoryMaxChars": 6000,
   "toolResultHistoryMaxLines": 120,
+  "proxyUrl": "http://127.0.0.1:7890",
+  "proxyUsername": "optional-username",
+  "proxyPassword": "optional-password",
   "adminApiKey": "your-admin-api-key-here",
-  "loadBalancingMode": "priority"
+  "loadBalancingMode": "priority",
+  "extractThinking": true
 }

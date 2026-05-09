@@ -13,7 +13,7 @@ from fastapi import Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 import token_counter as token_module
-from .converter import ConversionError, UnsupportedModelError, EmptyMessagesError, convert_request
+from .converter import ConversionError, UnsupportedModelError, EmptyMessagesError, convert_request, get_context_window_size
 from .middleware import AppState
 from .stream import BufferedStreamContext, SseEvent, StreamContext, CONTEXT_WINDOW_SIZE
 from .types import (
@@ -740,26 +740,31 @@ def _report_token_usage(model: str, input_tokens: int, output_tokens: int):
 # === 模型列表 ===
 
 MODELS = [
-    Model(id="claude-sonnet-4-5-20250929", object="model", created=1727568000,
-          owned_by="anthropic", display_name="Claude Sonnet 4.5", type="chat", max_tokens=32000),
-    Model(id="claude-sonnet-4-5-20250929-thinking", object="model", created=1727568000,
-          owned_by="anthropic", display_name="Claude Sonnet 4.5 (Thinking)", type="chat", max_tokens=32000),
-    Model(id="claude-opus-4-5-20251101", object="model", created=1730419200,
-          owned_by="anthropic", display_name="Claude Opus 4.5", type="chat", max_tokens=32000),
-    Model(id="claude-opus-4-5-20251101-thinking", object="model", created=1730419200,
-          owned_by="anthropic", display_name="Claude Opus 4.5 (Thinking)", type="chat", max_tokens=32000),
-    Model(id="claude-sonnet-4-6", object="model", created=1770314400,
-          owned_by="anthropic", display_name="Claude Sonnet 4.6", type="chat", max_tokens=32000),
-    Model(id="claude-sonnet-4-6-thinking", object="model", created=1770314400,
-          owned_by="anthropic", display_name="Claude Sonnet 4.6 (Thinking)", type="chat", max_tokens=32000),
-    Model(id="claude-opus-4-6", object="model", created=1770314400,
-          owned_by="anthropic", display_name="Claude Opus 4.6", type="chat", max_tokens=32000),
-    Model(id="claude-opus-4-6-thinking", object="model", created=1770314400,
-          owned_by="anthropic", display_name="Claude Opus 4.6 (Thinking)", type="chat", max_tokens=32000),
-    Model(id="claude-haiku-4-5-20251001", object="model", created=1727740800,
-          owned_by="anthropic", display_name="Claude Haiku 4.5", type="chat", max_tokens=32000),
-    Model(id="claude-haiku-4-5-20251001-thinking", object="model", created=1727740800,
-          owned_by="anthropic", display_name="Claude Haiku 4.5 (Thinking)", type="chat", max_tokens=32000),
+    # Opus 4.6（2026-02-04）
+    Model(id="claude-opus-4-6", object="model", created=1770163200,
+          owned_by="anthropic", display_name="Claude Opus 4.6", type="chat", max_tokens=64000),
+    Model(id="claude-opus-4-6-thinking", object="model", created=1770163200,
+          owned_by="anthropic", display_name="Claude Opus 4.6 (Thinking)", type="chat", max_tokens=64000),
+    # Sonnet 4.6（2026-02-17）
+    Model(id="claude-sonnet-4-6", object="model", created=1771286400,
+          owned_by="anthropic", display_name="Claude Sonnet 4.6", type="chat", max_tokens=64000),
+    Model(id="claude-sonnet-4-6-thinking", object="model", created=1771286400,
+          owned_by="anthropic", display_name="Claude Sonnet 4.6 (Thinking)", type="chat", max_tokens=64000),
+    # Opus 4.5（2025-11-24）
+    Model(id="claude-opus-4-5-20251101", object="model", created=1763942400,
+          owned_by="anthropic", display_name="Claude Opus 4.5", type="chat", max_tokens=64000),
+    Model(id="claude-opus-4-5-20251101-thinking", object="model", created=1763942400,
+          owned_by="anthropic", display_name="Claude Opus 4.5 (Thinking)", type="chat", max_tokens=64000),
+    # Sonnet 4.5（2025-09-29）
+    Model(id="claude-sonnet-4-5-20250929", object="model", created=1759104000,
+          owned_by="anthropic", display_name="Claude Sonnet 4.5", type="chat", max_tokens=64000),
+    Model(id="claude-sonnet-4-5-20250929-thinking", object="model", created=1759104000,
+          owned_by="anthropic", display_name="Claude Sonnet 4.5 (Thinking)", type="chat", max_tokens=64000),
+    # Haiku 4.5（2025-10-15）
+    Model(id="claude-haiku-4-5-20251001", object="model", created=1760486400,
+          owned_by="anthropic", display_name="Claude Haiku 4.5", type="chat", max_tokens=64000),
+    Model(id="claude-haiku-4-5-20251001-thinking", object="model", created=1760486400,
+          owned_by="anthropic", display_name="Claude Haiku 4.5 (Thinking)", type="chat", max_tokens=64000),
 ]
 
 
@@ -792,14 +797,14 @@ def _override_thinking_from_model_name(payload: MessagesRequest) -> None:
         payload.output_config = {"effort": "high"}
 
 
-async def _handle_stream_request(provider, request_body: str, model: str, input_tokens: int, thinking_enabled: bool):
+async def _handle_stream_request(provider, request_body: str, model: str, input_tokens: int, thinking_enabled: bool, tool_name_map: Optional[Dict[str, str]] = None):
     """处理流式请求"""
     try:
         response = await provider.call_api_stream(request_body)
     except Exception as e:
         return _map_provider_error(e)
 
-    ctx = StreamContext(model, input_tokens, thinking_enabled)
+    ctx = StreamContext(model, input_tokens, thinking_enabled, tool_name_map)
     initial_events = ctx.generate_initial_events()
 
     async def event_generator():
@@ -904,14 +909,14 @@ async def _handle_stream_request(provider, request_body: str, model: str, input_
     )
 
 
-async def _handle_stream_request_buffered(provider, request_body: str, model: str, estimated_input_tokens: int, thinking_enabled: bool):
+async def _handle_stream_request_buffered(provider, request_body: str, model: str, estimated_input_tokens: int, thinking_enabled: bool, tool_name_map: Optional[Dict[str, str]] = None):
     """处理缓冲流式请求（/cc/v1/messages）"""
     try:
         response = await provider.call_api_stream(request_body)
     except Exception as e:
         return _map_provider_error(e)
 
-    buf_ctx = BufferedStreamContext(model, estimated_input_tokens, thinking_enabled)
+    buf_ctx = BufferedStreamContext(model, estimated_input_tokens, thinking_enabled, tool_name_map)
 
     async def event_generator():
         from kiro.parser.decoder import EventStreamDecoder
@@ -1049,8 +1054,13 @@ def _parse_event(frame):
     return None
 
 
-async def _handle_non_stream_request(provider, request_body: str, model: str, input_tokens: int):
-    """处理非流式请求"""
+async def _handle_non_stream_request(provider, request_body: str, model: str, input_tokens: int, extract_thinking: bool = False, tool_name_map: Optional[Dict[str, str]] = None):
+    """处理非流式请求
+
+    当 extract_thinking=True 时，会将累积文本中的 <thinking>...</thinking>
+    标签解析为独立的 thinking 内容块（与流式响应行为一致）。
+    tool_name_map 用于将 Kiro 返回的短工具名还原为原始长名称。
+    """
     from kiro.parser.decoder import EventStreamDecoder
     from kiro.model.events.assistant import AssistantResponseEvent
     from kiro.model.events.tool_use import ToolUseEvent
@@ -1113,9 +1123,12 @@ async def _handle_non_stream_request(provider, request_body: str, model: str, in
                     logger.error("ToolUseEvent JSON 解析失败: id=%s, name=%s, buf=%s",
                                  event.tool_use_id, event.name, repr(buf)[:500])
                     inp = {"raw_arguments": buf} if buf else {}
-                tool_uses.append({"type": "tool_use", "id": event.tool_use_id, "name": event.name, "input": inp})
+                # 还原原始工具名称（如果存在映射）
+                display_name = (tool_name_map or {}).get(event.name, event.name)
+                tool_uses.append({"type": "tool_use", "id": event.tool_use_id, "name": display_name, "input": inp})
         elif isinstance(event, ContextUsageEvent):
-            actual = int(event.context_usage_percentage * CONTEXT_WINDOW_SIZE / 100.0)
+            window = get_context_window_size(model)
+            actual = int(event.context_usage_percentage * window / 100.0)
             context_total_tokens = actual
             if event.context_usage_percentage >= 100.0:
                 stop_reason = "model_context_window_exceeded"
@@ -1135,7 +1148,15 @@ async def _handle_non_stream_request(provider, request_body: str, model: str, in
         has_tool_use = True
         if stop_reason == "end_turn":
             stop_reason = "tool_use"
-    if text_content:
+    if extract_thinking:
+        # 从完整文本中提取 thinking 块
+        from .stream import extract_thinking_from_complete_text
+        thinking_text, remaining_text = extract_thinking_from_complete_text(text_content)
+        if thinking_text:
+            content.append({"type": "thinking", "thinking": thinking_text})
+        if remaining_text:
+            content.append({"type": "text", "text": remaining_text})
+    elif text_content:
         content.append({"type": "text", "text": text_content})
     content.extend(tool_uses)
 
@@ -1207,8 +1228,7 @@ async def _process_messages_common(state: AppState, payload: MessagesRequest, us
         ).to_dict())
 
     kiro_request = {"conversationState": result.conversation_state.to_dict()}
-    if state.profile_arn:
-        kiro_request["profileArn"] = state.profile_arn
+    # profile_arn 由 provider 层根据实际凭据动态注入（见 KiroProvider.inject_profile_arn）
     request_body = json.dumps(kiro_request, ensure_ascii=False)
 
     input_tokens = token_module.count_all_tokens(
@@ -1263,18 +1283,30 @@ async def _process_messages_common(state: AppState, payload: MessagesRequest, us
     input_tokens = max(input_tokens, outbound_metrics.tokens)
     thinking = payload.get_thinking()
     thinking_enabled = thinking.is_enabled() if thinking else False
+    tool_name_map = result.tool_name_map
 
     if payload.stream:
         # 有 web_search 时走流式 auto-continue
         if has_ws:
             return await _handle_stream_auto_continue(
                 provider, state, payload, request_body, payload.model,
-                input_tokens, thinking_enabled,
+                input_tokens, thinking_enabled, tool_name_map,
             )
         if use_buffered:
-            return await _handle_stream_request_buffered(provider, request_body, payload.model, input_tokens, thinking_enabled)
-        return await _handle_stream_request(provider, request_body, payload.model, input_tokens, thinking_enabled)
-    return await _handle_non_stream_request(provider, request_body, payload.model, input_tokens)
+            return await _handle_stream_request_buffered(
+                provider, request_body, payload.model, input_tokens, thinking_enabled,
+                tool_name_map,
+            )
+        return await _handle_stream_request(
+            provider, request_body, payload.model, input_tokens, thinking_enabled,
+            tool_name_map,
+        )
+    # 非流式响应：仅在配置开启且模型启用 thinking 时提取 thinking 块
+    extract_thinking = state.extract_thinking and thinking_enabled
+    return await _handle_non_stream_request(
+        provider, request_body, payload.model, input_tokens, extract_thinking,
+        tool_name_map,
+    )
 
 
 async def post_messages(request: Request, payload: MessagesRequest):
@@ -1375,6 +1407,7 @@ def _make_final_delta_sse(input_tokens: int, output_tokens: int, stop_reason: st
 async def _handle_stream_auto_continue(
     provider, state, payload: MessagesRequest, request_body: str,
     model: str, input_tokens: int, thinking_enabled: bool,
+    tool_name_map: Optional[Dict[str, str]] = None,
 ):
     """流式 web_search 自动续接：实时输出文本，拦截 tool_use 做搜索后继续流式"""
     try:
@@ -1384,7 +1417,12 @@ async def _handle_stream_auto_continue(
 
     msg_logger = get_message_logger()
 
+    # 初始工具名称映射（首轮转换的结果）
+    # 续接轮次会用各轮 convert_request 返回的新映射覆盖
+    current_tool_name_map: Dict[str, str] = dict(tool_name_map or {})
+    # 使用 closure 在 generator 中访问
     async def event_generator():
+        nonlocal current_tool_name_map
         from kiro.parser.decoder import EventStreamDecoder
         from kiro.parser.error import BufferOverflow
         ping_event = 'event: ping\ndata: {"type": "ping"}\n\n'
@@ -1395,7 +1433,7 @@ async def _handle_stream_auto_continue(
         is_first_round = True
 
         for round_idx in range(MAX_AUTO_CONTINUE_ROUNDS + 1):
-            ctx = StreamContext(model, input_tokens, thinking_enabled)
+            ctx = StreamContext(model, input_tokens, thinking_enabled, current_tool_name_map)
             init_events = ctx.generate_initial_events()
             round_started = False
             round_retry_attempts = 1
@@ -1555,9 +1593,11 @@ async def _handle_stream_auto_continue(
                 yield SseEvent("message_stop", {"type": "message_stop"}).to_sse_string()
                 return
 
+            # 更新工具名称映射供下一轮 StreamContext 使用
+            current_tool_name_map = cont_result.tool_name_map
+
             cont_kiro_req = {"conversationState": cont_result.conversation_state.to_dict()}
-            if state.profile_arn:
-                cont_kiro_req["profileArn"] = state.profile_arn
+            # profile_arn 由 provider 层根据实际凭据动态注入
             cont_body = json.dumps(cont_kiro_req, ensure_ascii=False)
 
             if msg_logger and msg_logger.enabled:

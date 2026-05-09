@@ -17,11 +17,11 @@ class Config:
     region: str = "us-east-1"
     auth_region: Optional[str] = None
     api_region: Optional[str] = None
-    kiro_version: str = "0.10.0"
+    kiro_version: str = "0.11.107"
     machine_id: Optional[str] = None
     api_key: Optional[str] = None
     system_version: str = field(default_factory=lambda: random.choice(SYSTEM_VERSIONS))
-    node_version: str = "22.21.1"
+    node_version: str = "22.22.0"
     tls_backend: str = "rustls"
     count_tokens_api_url: Optional[str] = None
     count_tokens_api_key: Optional[str] = None
@@ -41,6 +41,7 @@ class Config:
     proxy_password: Optional[str] = None
     admin_api_key: Optional[str] = None
     load_balancing_mode: str = "priority"
+    extract_thinking: bool = True
     _config_path: Optional[Path] = field(default=None, repr=False)
 
     # JSON key 映射 (camelCase -> snake_case)
@@ -66,6 +67,7 @@ class Config:
         "proxyUrl": "proxy_url", "proxyUsername": "proxy_username",
         "proxyPassword": "proxy_password", "adminApiKey": "admin_api_key",
         "loadBalancingMode": "load_balancing_mode",
+        "extractThinking": "extract_thinking",
     }
     _REVERSE_KEY_MAP = {v: k for k, v in _KEY_MAP.items()}
 
